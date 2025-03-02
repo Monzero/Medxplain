@@ -1,66 +1,53 @@
 import os
 import numpy as np
-import torch
+import tensorflow as tf
 import gradio as gr
 from PIL import Image
-import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 from io import BytesIO
 import base64
 
 # Import the explainability module
-from explainability_module import ExplainabilityTools
-
-# Configure device
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
+from explainability_module_tf import ExplainabilityTools
 
 # Load model and class names
 def load_model():
+    # Load the model
+    model = tf.keras.models.load_model('saved_model')
+    
     # Load class names
     class_names = np.load('class_names.npy', allow_pickle=True)
     
-    # Load model
-    model = torch.jit.load('model_scripted.pt')
-    model.eval()
-    model.to(device)
-    
     return model, class_names
 
-# Process image and make prediction
-def process_image(image_pil):
-    # Define transformations
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+# Process image
+def preprocess_image(image_pil):
+    # Resize image
+    image_pil = image_pil.resize((224, 224))
     
-    # Transform image
-    img_tensor = transform(image_pil)
+    # Convert to array and normalize
+    img_array = np.array(image_pil) / 255.0
     
-    return img_tensor
+    # Add batch dimension
+    img_array = np.expand_dims(img_array, axis=0)
+    
+    return img_array
 
-# Get model prediction
-def get_prediction(model, img_tensor, class_names):
-    # Add batch dimension and move to device
-    input_tensor = img_tensor.unsqueeze(0).to(device)
+# Get prediction from model
+def get_prediction(model, img_array, class_names):
+    # Get model predictions
+    predictions = model.predict(img_array)
     
-    # Make prediction
-    with torch.no_grad():
-        output = model(input_tensor)
-        probabilities = torch.nn.functional.softmax(output, dim=1)[0]
-        predicted_class_idx = torch.argmax(probabilities).item()
-        
-    # Get class name and probability
-    predicted_class = class_names[predicted_class_idx]
-    probability = probabilities[predicted_class_idx].item()
+    # Get top predicted class
+    pred_class_idx = np.argmax(predictions[0])
+    predicted_class = class_names[pred_class_idx]
+    confidence = predictions[0][pred_class_idx]
     
     # Get top 3 predictions
-    top3_prob, top3_idx = torch.topk(probabilities, 3)
-    top3_classes = [(class_names[idx.item()], prob.item()) for idx, prob in zip(top3_idx, top3_prob)]
+    top3_idx = np.argsort(predictions[0])[::-1][:3]
+    top3_classes = [(class_names[i], predictions[0][i]) for i in top3_idx]
     
-    return predicted_class, probability, top3_classes, predicted_class_idx
+    return predicted_class, confidence, top3_classes, pred_class_idx
 
 # Function to convert matplotlib figure to HTML
 def fig_to_html(fig):
@@ -68,53 +55,54 @@ def fig_to_html(fig):
     fig.savefig(buf, format='png', bbox_inches='tight')
     buf.seek(0)
     img_str = base64.b64encode(buf.read()).decode('utf-8')
+    plt.close(fig)
     return f'<img src="data:image/png;base64,{img_str}" />'
 
-# Gradio inference function with explainability
+# Gradio interface function with explainability
 def classify_and_explain(input_image, explanation_method):
     # Load model and class names
     model, class_names = load_model()
     
+    # Create explainability tools
+    explainer = ExplainabilityTools(model, class_names)
+    
     # Process image
-    img_tensor = process_image(input_image)
+    img_array = preprocess_image(input_image)
     
     # Get prediction
-    predicted_class, probability, top3_classes, class_idx = get_prediction(model, img_tensor, class_names)
-    
-    # Initialize explainability tools
-    explainer = ExplainabilityTools(model, class_names, device)
+    predicted_class, confidence, top3_classes, pred_class_idx = get_prediction(model, img_array, class_names)
     
     # Generate explanation based on selected method
     if explanation_method == "GradCAM":
-        cam_img, _, _ = explainer.get_gradcam(img_tensor, method='gradcam')
-        explanation_img = cam_img
+        _, cam_img, _ = explainer.get_gradcam(img_array)
+        explanation_img = Image.fromarray(cam_img)
         
     elif explanation_method == "GradCAM++":
-        cam_img, _, _ = explainer.get_gradcam(img_tensor, method='gradcam++')
-        explanation_img = cam_img
+        _, cam_img, _ = explainer.get_gradcam_plus_plus(img_array)
+        explanation_img = Image.fromarray(cam_img)
         
     elif explanation_method == "LIME":
-        lime_img, _, _, _, _ = explainer.get_lime_explanation(img_tensor)
-        explanation_img = lime_img
+        lime_img, _, _, _, _ = explainer.get_lime_explanation(img_array)
+        # Convert from float [0,1] to uint8 [0,255]
+        lime_img = (lime_img * 255).astype(np.uint8)
+        explanation_img = Image.fromarray(lime_img)
         
-    elif explanation_method == "Integrated Gradients":
-        ig_img, _, _, _, _ = explainer.get_integrated_gradients(img_tensor)
-        explanation_img = ig_img
+    elif explanation_method == "Occlusion Sensitivity":
+        _, sensitivity_map, _, _, _ = explainer.get_occlusion_sensitivity(img_array)
+        explanation_img = Image.fromarray(sensitivity_map)
         
     elif explanation_method == "Multi-Explanation":
-        # Get sample background images
-        bg_tensor = img_tensor.unsqueeze(0).repeat(10, 1, 1, 1)
-        bg_list = [bg_tensor[i] for i in range(10)]
+        # Create background images for SHAP (just duplicate the input image for simplicity)
+        bg_images = [img_array[0]] * 10
         
         # Generate comprehensive explanation
-        fig, _ = explainer.generate_explanation_report(img_tensor, bg_list)
+        fig = explainer.create_multi_explanation_visualization(img_array, bg_images)
         explanation_html = fig_to_html(fig)
-        plt.close(fig)
         
         # Format results
         result_html = f"""
         <div style='text-align: center;'>
-            <h2>Prediction: {predicted_class} ({probability:.2%})</h2>
+            <h2>Prediction: {predicted_class} ({confidence:.2%})</h2>
             <h3>Top 3 Predictions:</h3>
             <ul style='list-style-type: none;'>
                 <li>{top3_classes[0][0]}: {top3_classes[0][1]:.2%}</li>
@@ -129,22 +117,19 @@ def classify_and_explain(input_image, explanation_method):
     
     else:
         # Default to GradCAM if method not recognized
-        cam_img, _, _ = explainer.get_gradcam(img_tensor, method='gradcam')
-        explanation_img = cam_img
+        _, cam_img, _ = explainer.get_gradcam(img_array)
+        explanation_img = Image.fromarray(cam_img)
     
     # Format results for image-based explanations
     results = (
-        f"Prediction: {predicted_class} ({probability:.2%})\n\n"
+        f"Prediction: {predicted_class} ({confidence:.2%})\n\n"
         f"Top 3 Predictions:\n"
         f"1. {top3_classes[0][0]}: {top3_classes[0][1]:.2%}\n"
         f"2. {top3_classes[1][0]}: {top3_classes[1][1]:.2%}\n"
         f"3. {top3_classes[2][0]}: {top3_classes[2][1]:.2%}"
     )
     
-    # Convert numpy array to PIL Image
-    explanation_pil = Image.fromarray((explanation_img * 255).astype(np.uint8))
-    
-    return results, explanation_pil
+    return results, explanation_img
 
 # Create Gradio interface
 def create_interface():
@@ -156,7 +141,7 @@ def create_interface():
             with gr.Column():
                 input_image = gr.Image(type="pil", label="Input Image")
                 explanation_method = gr.Radio(
-                    ["GradCAM", "GradCAM++", "LIME", "Integrated Gradients", "Multi-Explanation"],
+                    ["GradCAM", "GradCAM++", "LIME", "Occlusion Sensitivity", "Multi-Explanation"],
                     label="Explanation Method",
                     value="GradCAM"
                 )
@@ -183,7 +168,7 @@ def create_interface():
         - **GradCAM**: Highlights regions that influenced the prediction
         - **GradCAM++**: An improved version of GradCAM with better localization
         - **LIME**: Explains predictions by perturbing the input
-        - **Integrated Gradients**: Attributes importance to input features
+        - **Occlusion Sensitivity**: Systematically occludes parts of the image to find important regions
         - **Multi-Explanation**: Provides a comprehensive view with multiple explanation techniques
         
         ## About the Model
