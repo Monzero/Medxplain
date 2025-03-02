@@ -140,10 +140,6 @@ The model is deployed using Gradio, providing an intuitive web interface where u
 
 The project evaluates both the classification performance (accuracy, precision, recall, F1-score) and the quality of explanations (localization, consistency, and clinical relevance).
 
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
 ## Acknowledgments
 
 - The HAM10000 dataset: https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/DBW86T
