@@ -83,8 +83,8 @@ The project includes the following key components:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/skin-disease-classification.git
-cd skin-disease-classification
+gh repo clone Monzero/Medxplain
+cd Medxplain
 
 # Install dependencies
 pip install -r requirements.txt
