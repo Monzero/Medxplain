@@ -10,38 +10,28 @@ import zipfile
 import requests
 from io import BytesIO
 
-# For deep learning
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import torchvision
-from torchvision import transforms, models
-import torch.nn.functional as F
+# For deep learning with TensorFlow
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, models, applications
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
 # For model evaluation
 from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
-# For explainability
-from pytorch_grad_cam import GradCAM, ScoreCAM, GradCAMPlusPlus, AblationCAM, XGradCAM
-from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-from pytorch_grad_cam.utils.image import show_cam_on_image
-import lime
-from lime import lime_image
-import shap
-
 # Set random seeds for reproducibility
 random.seed(42)
 np.random.seed(42)
-torch.manual_seed(42)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(42)
+tf.random.set_seed(42)
 
-# Device configuration
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
+# Check for GPU
+print("TensorFlow version:", tf.__version__)
+print("GPU Available: ", len(tf.config.list_physical_devices('GPU')) > 0)
+if len(tf.config.list_physical_devices('GPU')) > 0:
+    print("GPU Devices:", tf.config.list_physical_devices('GPU'))
 
 # Define paths
 DATA_DIR = 'data/HAM10000/'
@@ -103,27 +93,6 @@ download_ham10000()
 # 1. Data Loading and Preprocessing
 # --------------------------------
 
-class HAM10000Dataset(Dataset):
-    """
-    HAM10000 Dataset Class
-    """
-    def __init__(self, df, transform=None):
-        self.df = df
-        self.transform = transform
-        
-    def __len__(self):
-        return len(self.df)
-    
-    def __getitem__(self, idx):
-        img_name = os.path.join(IMAGES_PATH, self.df.iloc[idx, 0] + '.jpg')
-        image = Image.open(img_name).convert('RGB')
-        label = self.df.iloc[idx, 1]
-        
-        if self.transform:
-            image = self.transform(image)
-            
-        return image, label
-
 def load_data():
     """
     Load and preprocess the HAM10000 dataset
@@ -150,23 +119,6 @@ def load_data():
     plt.savefig('class_distribution.png')
     plt.close()
     
-    # Data transformations
-    train_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(),
-        transforms.RandomRotation(20),
-        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    val_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
     # Split data into train, validation, and test sets
     train_df, temp_df = train_test_split(df, test_size=0.3, random_state=42, stratify=df['label'])
     val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42, stratify=temp_df['label'])
@@ -175,148 +127,156 @@ def load_data():
     print(f"Validation set size: {len(val_df)}")
     print(f"Test set size: {len(test_df)}")
     
-    # Create datasets
-    train_dataset = HAM10000Dataset(train_df[['image_id', 'label']], transform=train_transform)
-    val_dataset = HAM10000Dataset(val_df[['image_id', 'label']], transform=val_transform)
-    test_dataset = HAM10000Dataset(test_df[['image_id', 'label']], transform=val_transform)
+    # Add path column to dataframes
+    train_df['path'] = train_df['image_id'].apply(lambda x: os.path.join(IMAGES_PATH, x + '.jpg'))
+    val_df['path'] = val_df['image_id'].apply(lambda x: os.path.join(IMAGES_PATH, x + '.jpg'))
+    test_df['path'] = test_df['image_id'].apply(lambda x: os.path.join(IMAGES_PATH, x + '.jpg'))
     
-    # Create dataloaders
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
+    return train_df, val_df, test_df, class_names
+
+def create_data_generators(train_df, val_df, test_df, batch_size=32, img_size=(224, 224)):
+    """
+    Create data generators for training, validation and test sets
+    """
+    # Data augmentation for training
+    train_datagen = ImageDataGenerator(
+        rescale=1./255,
+        rotation_range=20,
+        width_shift_range=0.1,
+        height_shift_range=0.1,
+        shear_range=0.1,
+        zoom_range=0.1,
+        horizontal_flip=True,
+        vertical_flip=True,
+        fill_mode='nearest'
+    )
     
-    return train_loader, val_loader, test_loader, class_names, test_df
+    # Only rescaling for validation and test
+    val_datagen = ImageDataGenerator(rescale=1./255)
+    test_datagen = ImageDataGenerator(rescale=1./255)
+    
+    # Create generators
+    train_generator = train_datagen.flow_from_dataframe(
+        dataframe=train_df,
+        x_col='path',
+        y_col='label',
+        target_size=img_size,
+        batch_size=batch_size,
+        class_mode='sparse',
+        shuffle=True
+    )
+    
+    val_generator = val_datagen.flow_from_dataframe(
+        dataframe=val_df,
+        x_col='path',
+        y_col='label',
+        target_size=img_size,
+        batch_size=batch_size,
+        class_mode='sparse',
+        shuffle=False
+    )
+    
+    test_generator = test_datagen.flow_from_dataframe(
+        dataframe=test_df,
+        x_col='path',
+        y_col='label',
+        target_size=img_size,
+        batch_size=batch_size,
+        class_mode='sparse',
+        shuffle=False
+    )
+    
+    return train_generator, val_generator, test_generator
 
 # 2. Model Building
 # ----------------
 
-class SkinLesionModel(nn.Module):
+def build_model(num_classes, img_size=(224, 224)):
     """
-    CNN model for skin lesion classification
+    Build a model using transfer learning with ResNet50
     """
-    def __init__(self, num_classes):
-        super(SkinLesionModel, self).__init__()
-        # Load a pre-trained ResNet50 model
-        self.model = models.resnet50(pretrained=True)
-        
-        # Freeze early layers
-        for param in list(self.model.parameters())[:-20]:
-            param.requires_grad = False
-            
-        # Replace the final fully connected layer
-        num_ftrs = self.model.fc.in_features
-        self.model.fc = nn.Sequential(
-            nn.Linear(num_ftrs, 256),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, num_classes)
-        )
-        
-    def forward(self, x):
-        return self.model(x)
+    # Load pre-trained ResNet50 without top layer
+    base_model = applications.ResNet50(
+        include_top=False,
+        weights='imagenet',
+        input_shape=(*img_size, 3)
+    )
     
-    def get_gradcam_layer(self):
-        """Return the target layer for GradCAM"""
-        return self.model.layer4[-1]
+    # Freeze early layers
+    for layer in base_model.layers[:-20]:
+        layer.trainable = False
+    
+    # Build the model
+    model = models.Sequential([
+        base_model,
+        layers.GlobalAveragePooling2D(),
+        layers.Dense(256, activation='relu'),
+        layers.Dropout(0.5),
+        layers.Dense(num_classes, activation='softmax')
+    ])
+    
+    # Compile the model
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=0.0001),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    return model
 
-def train_model(model, train_loader, val_loader, num_epochs=20):
+def train_model(model, train_generator, val_generator, epochs=20):
     """
-    Train the model
+    Train the model with appropriate callbacks
     """
-    # Loss function and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.0001)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3, verbose=True)
+    # Callbacks
+    checkpoint = ModelCheckpoint(
+        'best_model.h5',
+        monitor='val_loss',
+        verbose=1,
+        save_best_only=True,
+        mode='min'
+    )
     
-    # Training loop
-    best_val_loss = float('inf')
-    history = {
-        'train_loss': [],
-        'train_acc': [],
-        'val_loss': [],
-        'val_acc': []
-    }
+    early_stopping = EarlyStopping(
+        monitor='val_loss',
+        patience=5,
+        verbose=1,
+        restore_best_weights=True
+    )
     
-    for epoch in range(num_epochs):
-        # Training phase
-        model.train()
-        train_loss = 0.0
-        train_correct = 0
-        
-        for images, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]"):
-            images, labels = images.to(device), labels.to(device)
-            
-            # Forward pass
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            
-            # Backward and optimize
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            train_loss += loss.item() * images.size(0)
-            _, predicted = torch.max(outputs, 1)
-            train_correct += (predicted == labels).sum().item()
-        
-        # Calculate training statistics
-        train_loss = train_loss / len(train_loader.dataset)
-        train_acc = train_correct / len(train_loader.dataset)
-        
-        # Validation phase
-        model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        
-        with torch.no_grad():
-            for images, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
-                images, labels = images.to(device), labels.to(device)
-                
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-                
-                val_loss += loss.item() * images.size(0)
-                _, predicted = torch.max(outputs, 1)
-                val_correct += (predicted == labels).sum().item()
-        
-        # Calculate validation statistics
-        val_loss = val_loss / len(val_loader.dataset)
-        val_acc = val_correct / len(val_loader.dataset)
-        
-        # Update learning rate
-        scheduler.step(val_loss)
-        
-        # Save the best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), 'best_model.pth')
-            print(f"Model saved at epoch {epoch+1} with validation loss: {val_loss:.4f}")
-        
-        # Update history
-        history['train_loss'].append(train_loss)
-        history['train_acc'].append(train_acc)
-        history['val_loss'].append(val_loss)
-        history['val_acc'].append(val_acc)
-        
-        # Print epoch statistics
-        print(f"Epoch {epoch+1}/{num_epochs} - "
-              f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, "
-              f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+    reduce_lr = ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.1,
+        patience=3,
+        verbose=1,
+        min_lr=1e-6
+    )
+    
+    # Train the model
+    history = model.fit(
+        train_generator,
+        steps_per_epoch=len(train_generator),
+        epochs=epochs,
+        validation_data=val_generator,
+        validation_steps=len(val_generator),
+        callbacks=[checkpoint, early_stopping, reduce_lr],
+        verbose=1
+    )
     
     # Plot training history
     plt.figure(figsize=(12, 5))
     
     plt.subplot(1, 2, 1)
-    plt.plot(history['train_loss'], label='Train Loss')
-    plt.plot(history['val_loss'], label='Val Loss')
+    plt.plot(history.history['loss'], label='Train Loss')
+    plt.plot(history.history['val_loss'], label='Val Loss')
     plt.xlabel('Epochs')
     plt.ylabel('Loss')
     plt.legend()
     plt.title('Loss Curves')
     
     plt.subplot(1, 2, 2)
-    plt.plot(history['train_acc'], label='Train Accuracy')
-    plt.plot(history['val_acc'], label='Val Accuracy')
+    plt.plot(history.history['accuracy'], label='Train Accuracy')
+    plt.plot(history.history['val_accuracy'], label='Val Accuracy')
     plt.xlabel('Epochs')
     plt.ylabel('Accuracy')
     plt.legend()
@@ -325,34 +285,34 @@ def train_model(model, train_loader, val_loader, num_epochs=20):
     plt.savefig('training_history.png')
     plt.close()
     
-    return model, history
+    return history, model
 
-def evaluate_model(model, test_loader, class_names):
+def evaluate_model(model, test_generator, class_names):
     """
     Evaluate the model on the test set
     """
-    model.eval()
-    all_preds = []
-    all_labels = []
+    # Predict on test data
+    test_generator.reset()
+    predictions = model.predict(
+        test_generator,
+        steps=len(test_generator),
+        verbose=1
+    )
     
-    with torch.no_grad():
-        for images, labels in tqdm(test_loader, desc="Evaluating"):
-            images, labels = images.to(device), labels.to(device)
-            
-            outputs = model(images)
-            _, predicted = torch.max(outputs, 1)
-            
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+    # Get predicted classes
+    predicted_classes = np.argmax(predictions, axis=1)
+    
+    # Get true classes
+    true_classes = test_generator.classes
     
     # Calculate classification report
-    report = classification_report(all_labels, all_preds, target_names=class_names, output_dict=True)
+    report = classification_report(true_classes, predicted_classes, target_names=class_names, output_dict=True)
     df_report = pd.DataFrame(report).transpose()
     print("Classification Report:")
     print(df_report)
     
     # Plot confusion matrix
-    cm = confusion_matrix(all_labels, all_preds)
+    cm = confusion_matrix(true_classes, predicted_classes)
     plt.figure(figsize=(10, 8))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
     plt.xlabel('Predicted Labels')
@@ -361,261 +321,373 @@ def evaluate_model(model, test_loader, class_names):
     plt.savefig('confusion_matrix.png')
     plt.close()
     
-    return df_report, cm, all_preds, all_labels
+    return df_report, cm, true_classes, predicted_classes, predictions
 
 # 3. Explainability Techniques
 # ---------------------------
 
-def get_gradcam_visualization(model, img_tensor, target_class=None):
+def get_gradcam(model, img_array, pred_index=None, layer_name=None):
     """
-    Generate Grad-CAM visualization for the given image
+    Generate Grad-CAM for a specific image
+    
+    Args:
+        model: A TensorFlow model
+        img_array: Input image as numpy array (1, height, width, channels)
+        pred_index: Index of the class to generate CAM for, if None uses the predicted class
+        layer_name: Name of the layer to use for CAM, if None uses the last conv layer
+        
+    Returns:
+        Original image and heatmap overlay
     """
-    # Prepare the input
-    input_tensor = img_tensor.unsqueeze(0).to(device)
+    # Get the last convolutional layer if not specified
+    if layer_name is None:
+        for layer in reversed(model.layers):
+            if len(layer.output_shape) == 4:
+                layer_name = layer.name
+                break
     
-    # Create a GradCAM object
-    cam = GradCAM(model=model, target_layers=[model.get_gradcam_layer()])
-    
-    # Define target
-    targets = None
-    if target_class is not None:
-        targets = [ClassifierOutputTarget(target_class)]
-    
-    # Generate CAM
-    grayscale_cam = cam(input_tensor=input_tensor, targets=targets)
-    grayscale_cam = grayscale_cam[0, :]
-    
-    # Convert tensor to numpy for visualization
-    rgb_img = img_tensor.cpu().numpy().transpose(1, 2, 0)
-    rgb_img = (rgb_img - rgb_img.min()) / (rgb_img.max() - rgb_img.min())
-    
-    # Overlay CAM on original image
-    cam_image = show_cam_on_image(rgb_img, grayscale_cam, use_rgb=True)
-    
-    return cam_image, grayscale_cam
-
-def get_lime_explanation(model, img_tensor, class_names):
-    """
-    Generate LIME explanation for the given image
-    """
-    # Create the LIME explainer
-    explainer = lime_image.LimeImageExplainer()
-    
-    # Convert the PyTorch tensor to a numpy array for LIME
-    img_np = img_tensor.cpu().numpy().transpose(1, 2, 0)
-    img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
-    
-    # Define the prediction function for LIME
-    def batch_predict(images):
-        batch = torch.stack(tuple(torch.from_numpy(i.transpose(2, 0, 1)) for i in images))
-        batch = batch.to(device)
-        model.eval()
-        output = model(batch)
-        return output.detach().cpu().numpy()
-    
-    # Generate explanation
-    explanation = explainer.explain_instance(
-        img_np, 
-        batch_predict, 
-        top_labels=5, 
-        hide_color=0, 
-        num_samples=1000
+    # Create a model that maps the input image to the activations
+    # of the last conv layer and the output predictions
+    grad_model = tf.keras.models.Model(
+        inputs=[model.inputs],
+        outputs=[model.get_layer(layer_name).output, model.output]
     )
     
-    # Get the top predicted class
-    model.eval()
-    with torch.no_grad():
-        output = model(img_tensor.unsqueeze(0).to(device))
-        _, pred_class = torch.max(output, 1)
-        pred_class = pred_class.item()
+    # Then, we compute the gradient of the predicted class with respect to
+    # the activations of the last conv layer
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_array)
+        if pred_index is None:
+            pred_index = tf.argmax(predictions[0])
+        class_channel = predictions[:, pred_index]
     
-    # Get the explanation for the predicted class
+    # This is the gradient of the predicted class with regard to
+    # the output feature map of the last conv layer
+    grads = tape.gradient(class_channel, conv_outputs)
+    
+    # Vector of mean intensity of the gradient over a specific feature map channel
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    
+    # We multiply each channel in the feature map array
+    # by "how important this channel is" with regard to the predicted class
+    conv_outputs = conv_outputs[0]
+    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
+    heatmap = tf.squeeze(heatmap)
+    
+    # For visualization purpose, we normalize the heatmap between 0 & 1
+    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
+    heatmap = heatmap.numpy()
+    
+    # Resize the heatmap to match the original image size
+    img = img_array[0]
+    img = (img * 255).astype(np.uint8)  # Convert to 0-255 range
+    
+    heatmap_resized = np.uint8(255 * heatmap)
+    heatmap_resized = np.array(Image.fromarray(heatmap_resized).resize(
+        (img.shape[1], img.shape[0]),
+        resample=Image.BICUBIC
+    ))
+    
+    # Apply colormap to heatmap
+    heatmap_colored = np.uint8(plt.cm.jet(heatmap_resized)[..., :3] * 255)
+    
+    # Superimpose the heatmap on original image
+    superimposed_img = heatmap_colored * 0.4 + img
+    superimposed_img = np.clip(superimposed_img, 0, 255).astype(np.uint8)
+    
+    return img, superimposed_img, heatmap_resized
+
+def load_and_preprocess_image(img_path, img_size=(224, 224)):
+    """
+    Load and preprocess an image for model prediction
+    """
+    img = tf.keras.preprocessing.image.load_img(img_path, target_size=img_size)
+    img_array = tf.keras.preprocessing.image.img_to_array(img)
+    img_array = np.expand_dims(img_array, axis=0)
+    img_array = img_array / 255.0  # Normalize
+    
+    return img_array
+
+def lime_explanation(model, img_array, class_names, img_size=(224, 224), num_samples=1000):
+    """
+    Generate LIME explanation for the image
+    
+    Note: This is a wrapper around LIME for TensorFlow models
+    """
+    # Import LIME
+    from lime import lime_image
+    from skimage.segmentation import mark_boundaries
+    
+    # Create explainer
+    explainer = lime_image.LimeImageExplainer()
+    
+    # Define prediction function
+    def predict_fn(images):
+        # Reshape and preprocess images for model
+        processed = []
+        for img in images:
+            img = np.expand_dims(img, axis=0)
+            processed.append(img)
+        
+        # Stack all images into a batch
+        batch = np.vstack(processed)
+        
+        # Get model predictions
+        preds = model.predict(batch)
+        return preds
+    
+    # Get explanation
+    explanation = explainer.explain_instance(
+        img_array[0].astype('double'), 
+        predict_fn,
+        top_labels=5, 
+        hide_color=0, 
+        num_samples=num_samples
+    )
+    
+    # Get predicted class
+    pred = model.predict(img_array)
+    pred_class = np.argmax(pred[0])
+    
+    # Get explanation for predicted class
     temp, mask = explanation.get_image_and_mask(
-        pred_class, 
-        positive_only=True, 
-        num_features=5, 
+        pred_class,
+        positive_only=True,
+        num_features=5,
         hide_rest=True
     )
     
-    # Create the visualization
+    # Create visualization
     lime_img = mark_boundaries(temp, mask)
     
-    return lime_img, explanation, pred_class
+    # Get explanation with negative features
+    temp_neg, mask_neg = explanation.get_image_and_mask(
+        pred_class,
+        positive_only=False,
+        negative_only=True,
+        num_features=5,
+        hide_rest=True
+    )
+    
+    lime_img_neg = mark_boundaries(temp_neg, mask_neg, color=(1, 0, 0))
+    
+    return lime_img, lime_img_neg, explanation, pred_class, pred[0][pred_class]
 
-def get_shap_explanation(model, img_tensor, background_imgs):
+def shap_explanation(model, img_array, background_images):
     """
-    Generate SHAP explanation for the given image
+    Generate SHAP values for the image
+    
+    Args:
+        model: TensorFlow model
+        img_array: Image to explain (1, height, width, channels)
+        background_images: Background images for SHAP explainer
+        
+    Returns:
+        SHAP visualization and values
     """
-    # Convert background images to a tensor
-    background = torch.stack(background_imgs).to(device)
+    # Import SHAP
+    import shap
     
-    # Define a function to get model outputs
-    def model_output(images):
-        model.eval()
-        return model(images)
+    # Create a background dataset (subset of the training data)
+    background = np.vstack(background_images)
     
-    # Create the explainer
-    explainer = shap.DeepExplainer(model_output, background)
+    # Create explainer
+    explainer = shap.DeepExplainer(model, background)
     
-    # Get SHAP values
-    input_tensor = img_tensor.unsqueeze(0).to(device)
-    shap_values = explainer.shap_values(input_tensor)
+    # Compute SHAP values
+    shap_values = explainer.shap_values(img_array)
     
-    # Prepare the image for visualization
-    img_np = img_tensor.cpu().numpy()
+    # Get predicted class
+    pred = model.predict(img_array)
+    pred_class = np.argmax(pred[0])
     
-    # Compute absolute sum of SHAP values across channels for each pixel
-    shap_abs_sum = np.abs(np.array(shap_values)).sum(axis=1).sum(axis=1)
+    # Prepare visualization
+    # SHAP returns a list of arrays, one per class
+    shap_for_pred_class = shap_values[pred_class][0]
     
-    return shap_values, shap_abs_sum, img_np
+    # Compute absolute sum across channels for importance
+    abs_shap_values = np.abs(shap_for_pred_class).sum(axis=2)
+    
+    # Normalize for visualization
+    max_val = np.max(abs_shap_values)
+    if max_val > 0:
+        abs_shap_norm = abs_shap_values / max_val
+    else:
+        abs_shap_norm = abs_shap_values
+    
+    # Create heatmap
+    heatmap = plt.cm.jet(abs_shap_norm)[:, :, :3]
+    
+    # Blend with original image
+    original_img = img_array[0]
+    shap_img = 0.7 * original_img + 0.3 * heatmap
+    
+    return shap_img, abs_shap_norm, shap_values, pred_class, pred[0][pred_class]
 
 # 4. Experiments to Improve Explainability
 # ---------------------------------------
 
-def combined_explainability(model, img_tensor, class_names, background_imgs):
+def combined_explainability(model, img_path, class_names, background_images=None, img_size=(224, 224)):
     """
-    Combine different explainability methods for a more comprehensive visualization
+    Combine different explainability methods for a comprehensive view
     """
-    # Get individual explanations
-    gradcam_img, gradcam_map = get_gradcam_visualization(model, img_tensor)
-    lime_img, lime_exp, pred_class = get_lime_explanation(model, img_tensor, class_names)
-    shap_values, shap_abs_sum, img_np = get_shap_explanation(model, img_tensor, background_imgs)
+    # Load and preprocess the image
+    img_array = load_and_preprocess_image(img_path, img_size)
     
-    # Create a composite visualization
-    fig, axes = plt.subplots(2, 2, figsize=(12, 12))
+    # Get model prediction
+    pred = model.predict(img_array)
+    pred_class = np.argmax(pred[0])
+    confidence = pred[0][pred_class]
     
-    # Original image
-    img_np = img_tensor.cpu().numpy().transpose(1, 2, 0)
-    img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
-    axes[0, 0].imshow(img_np)
+    # Create figure
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # 1. Original image
+    orig_img = img_array[0]
+    axes[0, 0].imshow(orig_img)
     axes[0, 0].set_title('Original Image')
     axes[0, 0].axis('off')
     
-    # Grad-CAM
-    axes[0, 1].imshow(gradcam_img)
-    axes[0, 1].set_title('Grad-CAM Visualization')
+    # 2. GradCAM visualization
+    _, gradcam_img, _ = get_gradcam(model, img_array)
+    axes[0, 1].imshow(gradcam_img / 255.0)  # Normalize back to 0-1
+    axes[0, 1].set_title('GradCAM Visualization')
     axes[0, 1].axis('off')
     
-    # LIME
-    axes[1, 0].imshow(lime_img)
-    axes[1, 0].set_title('LIME Explanation')
-    axes[1, 0].axis('off')
+    # 3. Predicted class probabilities
+    class_probs = pred[0]
+    sorted_idx = np.argsort(class_probs)[::-1]
+    top_classes = [class_names[i] for i in sorted_idx[:5]]
+    top_probs = [class_probs[i] for i in sorted_idx[:5]]
     
-    # SHAP
-    shap_img = shap_values[pred_class][0].transpose(1, 2, 0)
-    abs_shap_img = np.abs(shap_img).sum(axis=2)
-    # Normalize for visualization
-    abs_shap_img = (abs_shap_img - abs_shap_img.min()) / (abs_shap_img.max() - abs_shap_img.min() + 1e-10)
-    axes[1, 1].imshow(abs_shap_img, cmap='hot')
-    axes[1, 1].set_title('SHAP Importance')
-    axes[1, 1].axis('off')
+    y_pos = np.arange(len(top_classes))
+    axes[0, 2].barh(y_pos, top_probs)
+    axes[0, 2].set_yticks(y_pos)
+    axes[0, 2].set_yticklabels(top_classes)
+    axes[0, 2].set_title('Top Class Probabilities')
+    axes[0, 2].set_xlim(0, 1)
     
-    plt.tight_layout()
+    # 4. LIME explanation (positive features)
+    try:
+        lime_img, lime_img_neg, _, _, _ = lime_explanation(model, img_array, class_names)
+        axes[1, 0].imshow(lime_img)
+        axes[1, 0].set_title('LIME (Positive Features)')
+        axes[1, 0].axis('off')
+        
+        # 5. LIME explanation (negative features)
+        axes[1, 1].imshow(lime_img_neg)
+        axes[1, 1].set_title('LIME (Negative Features)')
+        axes[1, 1].axis('off')
+    except Exception as e:
+        print(f"Error with LIME: {e}")
+        axes[1, 0].text(0.5, 0.5, 'LIME error', ha='center', va='center')
+        axes[1, 0].axis('off')
+        axes[1, 1].text(0.5, 0.5, 'LIME error', ha='center', va='center')
+        axes[1, 1].axis('off')
+    
+    # 6. SHAP explanation (if background images are provided)
+    if background_images is not None:
+        try:
+            shap_img, _, _, _, _ = shap_explanation(model, img_array, background_images)
+            axes[1, 2].imshow(shap_img)
+            axes[1, 2].set_title('SHAP Explanation')
+            axes[1, 2].axis('off')
+        except Exception as e:
+            print(f"Error with SHAP: {e}")
+            axes[1, 2].text(0.5, 0.5, 'SHAP error', ha='center', va='center')
+            axes[1, 2].axis('off')
+    else:
+        axes[1, 2].text(0.5, 0.5, 'Background images required for SHAP', ha='center', va='center')
+        axes[1, 2].axis('off')
+    
+    # Add prediction information as title
+    fig.suptitle(f"Prediction: {class_names[pred_class]} (Confidence: {confidence:.2f})", fontsize=16)
     
     return fig
 
-def evaluate_explainability(model, test_loader, class_names, test_df):
+def evaluate_explainability_methods(model, test_df, class_names, num_samples=5):
     """
-    Evaluate different explainability methods on test images
+    Evaluate different explainability methods on sample images
     """
-    model.eval()
+    # Sample random images from test set
+    sampled_indices = np.random.choice(len(test_df), num_samples, replace=False)
     
-    # Get a batch of images for background (for SHAP)
-    background_imgs = []
-    for images, _ in test_loader:
-        background_imgs = list(images[:10])
-        break
+    # Create a set of background images for SHAP
+    background_images = []
+    for i in range(min(10, len(test_df))):
+        img_path = test_df.iloc[i]['path']
+        img_array = load_and_preprocess_image(img_path)
+        background_images.append(img_array[0])
     
-    # Select a few test images for visualization
-    sample_indices = np.random.choice(len(test_df), 5, replace=False)
-    sample_images = []
-    
-    for i, idx in enumerate(sample_indices):
-        img_path = os.path.join(IMAGES_PATH, test_df.iloc[idx]['image_id'] + '.jpg')
-        img = Image.open(img_path).convert('RGB')
-        transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        img_tensor = transform(img)
+    # Generate explanations for each sampled image
+    for idx, i in enumerate(sampled_indices):
+        img_path = test_df.iloc[i]['path']
+        true_class = test_df.iloc[i]['label']
         
-        # Get true class
-        true_class = test_df.iloc[idx]['label']
+        # Create combined visualization
+        fig = combined_explainability(model, img_path, class_names, background_images)
         
-        # Make prediction
-        model.eval()
-        with torch.no_grad():
-            output = model(img_tensor.unsqueeze(0).to(device))
-            _, pred_class = torch.max(output, 1)
-            pred_class = pred_class.item()
+        # Add true class information
+        plt.figtext(0.5, 0.01, f"True Class: {class_names[true_class]}", ha='center', fontsize=12)
         
-        # Generate combined explanation
-        fig = combined_explainability(model, img_tensor, class_names, background_imgs)
-        
-        # Add class information
-        fig.suptitle(f"True: {class_names[true_class]} | Predicted: {class_names[pred_class]}", fontsize=16)
-        
-        # Save the visualization
-        plt.savefig(f'explanation_sample_{i+1}.png')
+        # Save the figure
+        plt.savefig(f'explanation_sample_{idx+1}.png', bbox_inches='tight')
         plt.close(fig)
-        
-        sample_images.append((img_tensor, true_class, pred_class))
     
-    print("Saved explainability visualizations for 5 sample images.")
+    print(f"Generated explanations for {num_samples} sample images.")
     
-    # Experiment: Compare different Grad-CAM variants
-    # Select one sample image
-    img_tensor, true_class, _ = sample_images[0]
+    # Compare different variants of GradCAM
+    img_path = test_df.iloc[sampled_indices[0]]['path']
+    img_array = load_and_preprocess_image(img_path)
     
-    # Define different Grad-CAM variants
-    cam_algorithms = {
-        'GradCAM': GradCAM,
-        'GradCAM++': GradCAMPlusPlus,
-        'ScoreCAM': ScoreCAM,
-        'XGradCAM': XGradCAM,
-        'AblationCAM': AblationCAM
-    }
-    
+    # Compare GradCAM for different layers
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    axes = axes.flatten()
     
     # Original image
-    img_np = img_tensor.cpu().numpy().transpose(1, 2, 0)
-    img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
-    axes[0].imshow(img_np)
-    axes[0].set_title('Original Image')
-    axes[0].axis('off')
+    axes[0, 0].imshow(img_array[0])
+    axes[0, 0].set_title('Original Image')
+    axes[0, 0].axis('off')
     
-    # Generate visualizations for each method
-    for i, (name, algorithm) in enumerate(cam_algorithms.items(), 1):
-        try:
-            # Create the CAM object
-            cam = algorithm(model=model, target_layers=[model.get_gradcam_layer()])
-            
-            # Generate CAM
-            input_tensor = img_tensor.unsqueeze(0).to(device)
-            targets = [ClassifierOutputTarget(true_class)]
-            grayscale_cam = cam(input_tensor=input_tensor, targets=targets)
-            grayscale_cam = grayscale_cam[0, :]
-            
-            # Overlay CAM on original image
-            cam_image = show_cam_on_image(img_np, grayscale_cam, use_rgb=True)
-            
-            # Add to plot
-            axes[i].imshow(cam_image)
-            axes[i].set_title(name)
-            axes[i].axis('off')
-        except Exception as e:
-            print(f"Error with {name}: {e}")
-            axes[i].text(0.5, 0.5, f"Error: {name}", ha='center', va='center')
-            axes[i].axis('off')
+    # Find conv layers to visualize
+    conv_layers = []
+    for layer in model.layers:
+        if isinstance(layer, keras.layers.Conv2D):
+            conv_layers.append(layer.name)
+        elif hasattr(layer, 'layers'):  # For models with nested layers like ResNet
+            for inner_layer in layer.layers:
+                if isinstance(inner_layer, keras.layers.Conv2D):
+                    conv_layers.append(inner_layer.name)
+    
+    # Select up to 5 layers evenly spaced throughout the network
+    if len(conv_layers) > 5:
+        indices = np.linspace(0, len(conv_layers)-1, 5, dtype=int)
+        conv_layers = [conv_layers[i] for i in indices]
+    
+    # Generate GradCAM for each layer
+    for i, layer_name in enumerate(conv_layers[:5]):  # Limit to 5 layers
+        row, col = (i // 3) + 1, i % 3
+        if row < 2 and col < 3:  # Ensure we don't exceed the grid
+            try:
+                _, gradcam_img, _ = get_gradcam(model, img_array, layer_name=layer_name)
+                axes[row, col].imshow(gradcam_img / 255.0)
+                axes[row, col].set_title(f'GradCAM: {layer_name.split("/")[-1]}')
+                axes[row, col].axis('off')
+            except Exception as e:
+                print(f"Error with GradCAM for layer {layer_name}: {e}")
+                axes[row, col].text(0.5, 0.5, f'Error: {layer_name}', ha='center', va='center')
+                axes[row, col].axis('off')
+    
+    # Fill any unused subplots
+    for i in range(len(conv_layers[:5]) + 1, 6):
+        row, col = (i // 3) + 1, i % 3
+        if row < 2 and col < 3:
+            axes[row, col].axis('off')
     
     plt.tight_layout()
-    plt.savefig('gradcam_comparison.png')
+    plt.savefig('gradcam_layer_comparison.png', bbox_inches='tight')
     plt.close()
     
-    return sample_images
+    return sampled_indices
 
 # 5. Model Export and Deployment
 # ----------------------------
@@ -624,98 +696,175 @@ def export_model(model, class_names):
     """
     Export the model for deployment
     """
-    # Save the model architecture and weights
-    torch.save(model.state_dict(), 'model_weights.pth')
-    torch.save(model, 'full_model.pth')
-    
-    # Save as TorchScript model for deployment
-    model.eval()
-    example = torch.rand(1, 3, 224, 224).to(device)
-    traced_script_module = torch.jit.trace(model, example)
-    traced_script_module.save('model_scripted.pt')
+    # Save model in TensorFlow SavedModel format
+    model.save('saved_model')
     
     # Save class names
     np.save('class_names.npy', class_names)
     
-    print("Model exported successfully.")
+    # Create a TFLite version for mobile deployment
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    tflite_model = converter.convert()
     
-    # Create a simple inference function for deployment
-    def inference(img_path, model_path='model_scripted.pt', class_names_path='class_names.npy'):
-        # Load model
-        model = torch.jit.load(model_path)
-        model.eval()
-        
-        # Load class names
-        class_names = np.load(class_names_path, allow_pickle=True)
-        
-        # Preprocess image
-        transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        
-        img = Image.open(img_path).convert('RGB')
-        img_tensor = transform(img).unsqueeze(0)
-        
-        # Make prediction
-        with torch.no_grad():
-            output = model(img_tensor)
-            probabilities = torch.nn.functional.softmax(output, dim=1)
-            _, predicted = torch.max(output, 1)
-            pred_class = predicted.item()
-        
-        return {
-            'predicted_class': class_names[pred_class],
-            'confidence': probabilities[0][pred_class].item(),
-            'probabilities': {class_names[i]: prob.item() for i, prob in enumerate(probabilities[0])}
-        }
+    with open('model.tflite', 'wb') as f:
+        f.write(tflite_model)
     
-    # Save the inference function code
+    print("Model exported in both SavedModel and TFLite formats.")
+    
+    # Save a model summary
+    with open('model_summary.txt', 'w') as f:
+        model.summary(print_fn=lambda x: f.write(x + '\n'))
+    
+    print("Model summary saved.")
+    
+    # Create a simple inference script
     with open('inference.py', 'w') as f:
         f.write("""
-import torch
 import numpy as np
+import tensorflow as tf
 from PIL import Image
-from torchvision import transforms
+import matplotlib.pyplot as plt
 
-def inference(img_path, model_path='model_scripted.pt', class_names_path='class_names.npy'):
-    # Load model
-    model = torch.jit.load(model_path)
-    model.eval()
+def load_model_and_classes():
+    # Load the model
+    model = tf.keras.models.load_model('saved_model')
     
     # Load class names
-    class_names = np.load(class_names_path, allow_pickle=True)
+    class_names = np.load('class_names.npy', allow_pickle=True)
     
-    # Preprocess image
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+    return model, class_names
+
+def preprocess_image(img_path, img_size=(224, 224)):
+    # Load image
+    img = Image.open(img_path).resize(img_size)
     
-    img = Image.open(img_path).convert('RGB')
-    img_tensor = transform(img).unsqueeze(0)
+    # Convert to array and add batch dimension
+    img_array = np.array(img) / 255.0
+    img_array = np.expand_dims(img_array, axis=0)
     
-    # Make prediction
-    with torch.no_grad():
-        output = model(img_tensor)
-        probabilities = torch.nn.functional.softmax(output, dim=1)
-        _, predicted = torch.max(output, 1)
-        pred_class = predicted.item()
+    return img_array
+
+def predict(model, img_array, class_names):
+    # Get predictions
+    predictions = model.predict(img_array)
+    
+    # Get top predicted class
+    pred_class_idx = np.argmax(predictions[0])
+    pred_class = class_names[pred_class_idx]
+    confidence = predictions[0][pred_class_idx]
+    
+    # Get top 3 predictions
+    top3_idx = np.argsort(predictions[0])[::-1][:3]
+    top3_classes = [(class_names[i], predictions[0][i]) for i in top3_idx]
+    
+    return pred_class, confidence, top3_classes
+
+def get_gradcam(model, img_array, layer_name=None):
+    # Find the last convolutional layer if not specified
+    if layer_name is None:
+        for layer in reversed(model.layers):
+            if len(layer.output_shape) == 4:
+                layer_name = layer.name
+                break
+    
+    # Create gradient model
+    grad_model = tf.keras.models.Model(
+        inputs=[model.inputs],
+        outputs=[model.get_layer(layer_name).output, model.output]
+    )
+    
+    # Calculate gradients
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_array)
+        pred_index = tf.argmax(predictions[0])
+        class_channel = predictions[:, pred_index]
+    
+    grads = tape.gradient(class_channel, conv_outputs)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    
+    # Weight channels by gradients
+    conv_outputs = conv_outputs[0]
+    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
+    heatmap = tf.squeeze(heatmap)
+    
+    # Normalize heatmap
+    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
+    heatmap = heatmap.numpy()
+    
+    # Resize heatmap to match image size
+    heatmap_resized = np.uint8(255 * heatmap)
+    heatmap_resized = np.array(Image.fromarray(heatmap_resized).resize(
+        (img_array.shape[2], img_array.shape[1]),
+        resample=Image.BICUBIC
+    ))
+    
+    # Create colored heatmap
+    heatmap_colored = np.uint8(plt.cm.jet(heatmap_resized)[..., :3] * 255)
+    
+    # Superimpose heatmap on original image
+    img = (img_array[0] * 255).astype(np.uint8)
+    superimposed = heatmap_colored * 0.4 + img
+    superimposed = np.clip(superimposed, 0, 255).astype(np.uint8)
+    
+    return superimposed
+
+def inference(img_path):
+    # Load model and classes
+    model, class_names = load_model_and_classes()
+    
+    # Process image
+    img_array = preprocess_image(img_path)
+    
+    # Get prediction
+    pred_class, confidence, top3_classes = predict(model, img_array, class_names)
+    
+    # Generate GradCAM explanation
+    gradcam_img = get_gradcam(model, img_array)
+    
+    # Create visualization
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+    
+    # Original image
+    ax1.imshow(img_array[0])
+    ax1.set_title('Original Image')
+    ax1.axis('off')
+    
+    # GradCAM
+    ax2.imshow(gradcam_img / 255.0)
+    ax2.set_title('GradCAM Explanation')
+    ax2.axis('off')
+    
+    # Add prediction information
+    plt.suptitle(f"Prediction: {pred_class} (Confidence: {confidence:.2f})", fontsize=16)
+    
+    # Print top 3 predictions
+    print("Top 3 predictions:")
+    for i, (cls, prob) in enumerate(top3_classes):
+        print(f"{i+1}. {cls}: {prob:.4f}")
+    
+    plt.show()
     
     return {
-        'predicted_class': class_names[pred_class],
-        'confidence': probabilities[0][pred_class].item(),
-        'probabilities': {class_names[i]: prob.item() for i, prob in enumerate(probabilities[0])}
+        'class': pred_class,
+        'confidence': float(confidence),
+        'top3': [(cls, float(prob)) for cls, prob in top3_classes]
     }
 
-# Example usage:
-# result = inference('path/to/your/image.jpg')
-# print(result)
+# Example usage
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1:
+        img_path = sys.argv[1]
+        result = inference(img_path)
+        print(f"Predicted class: {result['class']} with {result['confidence']:.2%} confidence")
+    else:
+        print("Please provide an image path as argument")
 """)
     
-    print("Inference script created: inference.py")
+    print("Inference script created.")
+    
+    return
 
 # Main function to run the pipeline
 def main():
@@ -724,23 +873,23 @@ def main():
     """
     # 1. Load and preprocess data
     print("1. Loading and preprocessing data...")
-    train_loader, val_loader, test_loader, class_names, test_df = load_data()
+    train_df, val_df, test_df, class_names = load_data()
+    
+    # Create data generators
+    train_generator, val_generator, test_generator = create_data_generators(train_df, val_df, test_df)
     
     # 2. Build and train the model
     print("\n2. Building and training the model...")
-    model = SkinLesionModel(num_classes=len(class_names)).to(device)
-    model, history = train_model(model, train_loader, val_loader, num_epochs=10)
-    
-    # Load the best model
-    model.load_state_dict(torch.load('best_model.pth'))
+    model = build_model(len(class_names))
+    history, model = train_model(model, train_generator, val_generator, epochs=10)
     
     # 3. Evaluate the model
     print("\n3. Evaluating the model...")
-    report, cm, all_preds, all_labels = evaluate_model(model, test_loader, class_names)
+    report, cm, true_classes, pred_classes, predictions = evaluate_model(model, test_generator, class_names)
     
     # 4. Apply explainability techniques
     print("\n4. Applying explainability techniques...")
-    sample_images = evaluate_explainability(model, test_loader, class_names, test_df)
+    evaluate_explainability_methods(model, test_df, class_names, num_samples=5)
     
     # 5. Export the model for deployment
     print("\n5. Exporting the model for deployment...")
