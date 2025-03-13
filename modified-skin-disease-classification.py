@@ -349,7 +349,7 @@ def create_data_generators(train_df, val_df, test_df, batch_size=32, img_size=(3
         y_col='label',
         target_size=img_size,
         batch_size=batch_size,
-        class_mode='categorical',  # Changed to categorical for one-hot encoding
+        class_mode='raw',  # Changed to categorical for one-hot encoding
         shuffle=True
     )
     
@@ -359,7 +359,7 @@ def create_data_generators(train_df, val_df, test_df, batch_size=32, img_size=(3
         y_col='label',
         target_size=img_size,
         batch_size=batch_size,
-        class_mode='categorical',
+        class_mode='raw',
         shuffle=False
     )
     
@@ -369,7 +369,7 @@ def create_data_generators(train_df, val_df, test_df, batch_size=32, img_size=(3
         y_col='label',
         target_size=img_size,
         batch_size=batch_size,
-        class_mode='categorical',
+        class_mode='raw',
         shuffle=False
     )
     
@@ -1037,12 +1037,12 @@ def main():
         use_generators = False
     else:
         print("CSV file not found. Using image-based preprocessing...")
-        train_generator, val_generator, test_generator, train_df, val_df, test_df = preprocess_data(df, image_size=(32, 32), use_csv=False)
+        train_generator, val_generator, test_generator, train_df, val_df, test_df = preprocess_data(df, image_size=(64, 64), use_csv=False)
         use_generators = True
     
     # 3. Build ViT model
     print("\n3. Building Vision Transformer model...")
-    input_shape = (32, 32, 3)
+    input_shape = (64, 64, 3)
     num_classes = 7
     
     # Calculate num_patches based on input size and patch size
