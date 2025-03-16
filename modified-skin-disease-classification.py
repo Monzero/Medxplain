@@ -166,6 +166,7 @@ def preprocess_data(df, image_size=(32, 32), use_csv=False):
     """
     Preprocess the dataset for training
     """
+    
     if use_csv:
         # If using CSV format (similar to HAM10000 ViT implementation)
         csv_path = os.path.join(DATA_DIR, 'hmnist_28_28_RGB.csv')
@@ -224,6 +225,8 @@ def preprocess_data(df, image_size=(32, 32), use_csv=False):
         df['label'] = le.fit_transform(df['dx'])
         class_mapping = dict(zip(range(len(le.classes_)), le.classes_))
         print("Class mapping:", class_mapping)
+        
+        df['label'] = df['label'].astype(str)
         
         # Check folder structure to locate images
         print("\nChecking directory structure...")
@@ -349,7 +352,7 @@ def create_data_generators(train_df, val_df, test_df, batch_size=32, img_size=(3
         y_col='label',
         target_size=img_size,
         batch_size=batch_size,
-        class_mode='raw',  # Changed to categorical for one-hot encoding
+        class_mode='categorical',  # Changed to categorical for one-hot encoding
         shuffle=True
     )
     
@@ -359,7 +362,7 @@ def create_data_generators(train_df, val_df, test_df, batch_size=32, img_size=(3
         y_col='label',
         target_size=img_size,
         batch_size=batch_size,
-        class_mode='raw',
+        class_mode='categorical',
         shuffle=False
     )
     
@@ -369,7 +372,7 @@ def create_data_generators(train_df, val_df, test_df, batch_size=32, img_size=(3
         y_col='label',
         target_size=img_size,
         batch_size=batch_size,
-        class_mode='raw',
+        class_mode='categorical',
         shuffle=False
     )
     
@@ -452,7 +455,7 @@ def create_vit_classifier(
     model = keras.Model(inputs=inputs, outputs=outputs)
     return model
 
-def train_model(model, train_data, val_data, epochs=30, batch_size=128, use_generators=True):
+def train_model(model, train_data, val_data, epochs=20, batch_size=128, use_generators=True):
     """
     Train the model with early stopping and model checkpointing
     
@@ -478,7 +481,7 @@ def train_model(model, train_data, val_data, epochs=30, batch_size=128, use_gene
     
     callback_early_stopping = EarlyStopping(
         monitor='val_accuracy',
-        patience=5,
+        patience=2,
         mode='max',
         verbose=1,
         restore_best_weights=True
@@ -754,7 +757,7 @@ def get_gradcam(model, img_array, pred_index=None):
     
     return img, superimposed_img, heatmap_resized
 
-def load_and_preprocess_image(img_path, img_size=(32, 32)):
+def load_and_preprocess_image(img_path, img_size=(64, 64)):
     """
     Load and preprocess a single image for model prediction
     """
@@ -831,6 +834,535 @@ def visualize_model_predictions(model, test_df, class_names, num_samples=5):
     plt.close()
     
     return sampled_indices
+
+def lime_explanation(model, img_array, class_names, img_size=(32, 32), num_samples=1000):
+
+    """
+    Generate LIME explanation for the image
+    
+    Note: This is a wrapper around LIME for TensorFlow models
+    """
+    # Import LIME
+    from lime import lime_image
+    from skimage.segmentation import mark_boundaries
+    
+    # Create explainer
+    explainer = lime_image.LimeImageExplainer()
+    
+    # Define prediction function
+    def predict_fn(images):
+        # Reshape and preprocess images for model
+        processed = []
+        for img in images:
+            img = np.expand_dims(img, axis=0)
+            processed.append(img)
+        
+        # Stack all images into a batch
+        batch = np.vstack(processed)
+        
+        # Get model predictions
+        preds = model.predict(batch)
+        return preds
+    
+    # Get explanation
+    explanation = explainer.explain_instance(
+        img_array[0].astype('double'), 
+        predict_fn,
+        top_labels=5, 
+        hide_color=0, 
+        num_samples=num_samples
+    )
+    
+    # Get predicted class
+    pred = model.predict(img_array)
+    pred_class = np.argmax(pred[0])
+    
+    # Get explanation for predicted class
+    temp, mask = explanation.get_image_and_mask(
+        pred_class,
+        positive_only=True,
+        num_features=5,
+        hide_rest=True
+    )
+    
+    # Create visualization
+    lime_img = mark_boundaries(temp, mask)
+    
+    # Get explanation with negative features
+    temp_neg, mask_neg = explanation.get_image_and_mask(
+        pred_class,
+        positive_only=False,
+        negative_only=True,
+        num_features=5,
+        hide_rest=True
+    )
+    
+    lime_img_neg = mark_boundaries(temp_neg, mask_neg, color=(1, 0, 0))
+    
+    return lime_img, lime_img_neg, explanation, pred_class, pred[0][pred_class]
+
+def shap_explanation(model, img_array, background_images):
+    """
+    Generate SHAP values for the image
+    
+    Args:
+        model: TensorFlow model
+        img_array: Image to explain (1, height, width, channels)
+        background_images: Background images for SHAP explainer
+        
+    Returns:
+        SHAP visualization and values
+    """
+    # Import SHAP
+    import shap
+    import numpy as np
+    import matplotlib.pyplot as plt
+    
+    # Create a properly shaped background dataset
+    if len(background_images) > 0:
+        # Check if the first background image has the batch dimension
+        if len(background_images[0].shape) == 3:  # Missing batch dimension
+            # Add batch dimension to each background image
+            background = np.stack([np.expand_dims(img, axis=0) for img in background_images])
+            # Reshape to (n_samples, height, width, channels)
+            background = background.reshape(-1, *background_images[0].shape)
+        else:
+            # If images already have batch dimension, just stack them
+            background = np.vstack(background_images)
+    else:
+        # If no background images, use a small subset of zeros
+        print("No background images provided, using zeros")
+        background = np.zeros((10, *img_array.shape[1:]), dtype=np.float32)
+    
+    print(f"Input image shape: {img_array.shape}")
+    print(f"Background shape: {background.shape}")
+    
+    try:
+        # Create explainer with proper error handling
+        explainer = shap.DeepExplainer(model, background)
+        
+        # Compute SHAP values
+        shap_values = explainer.shap_values(img_array)
+        
+        
+        
+        # Get predicted class
+        pred = model.predict(img_array)
+        pred_class = np.argmax(pred[0])
+        
+        # Handle different SHAP output formats
+        print(f"SHAP values type: {type(shap_values)}")
+        print(f"SHAP values length: {len(shap_values) if isinstance(shap_values, list) else 'Not a list'}")
+        
+        # Determine the appropriate SHAP values to use
+        if isinstance(shap_values, list):
+            if len(shap_values) > pred_class:
+                # Multi-class case where we have values for each class
+                print(f"Using SHAP values for class {pred_class}")
+                shap_for_display = shap_values[pred_class]
+            else:
+                # SHAP returned values only for class 0
+                print("SHAP only returned values for class 0")
+                shap_for_display = shap_values[0]
+        else:
+            # SHAP returned a single array
+            print("SHAP returned a single array")
+            shap_for_display = shap_values
+        
+        # Check if there's a batch dimension to handle
+        if len(shap_for_display.shape) > 3:  # Has batch dimension
+            shap_for_pred_class = shap_for_display[0]
+        else:
+            shap_for_pred_class = shap_for_display
+        
+        print(f"Final SHAP values shape: {shap_for_pred_class.shape}")
+        
+        # Compute absolute sum across channels for importance
+        if len(shap_for_pred_class.shape) == 3:  # height, width, channels
+            abs_shap_values = np.abs(shap_for_pred_class).sum(axis=2)
+        else:
+            # Handle unexpected shapes
+            abs_shap_values = np.abs(shap_for_pred_class).sum(axis=-1)
+        
+        # Normalize for visualization
+        max_val = np.max(abs_shap_values)
+        if max_val > 0:
+            abs_shap_norm = abs_shap_values / max_val
+        else:
+            abs_shap_norm = abs_shap_values
+        
+        # Create heatmap
+        heatmap = plt.cm.jet(abs_shap_norm)[:, :, :3]
+        
+        # Blend with original image
+        original_img = img_array[0]
+        shap_img = 0.7 * original_img + 0.3 * heatmap
+        
+        return shap_img, abs_shap_norm, shap_values, pred_class, pred[0][pred_class]
+        
+    except Exception as e:
+        print(f"Error generating SHAP explanation: {e}")
+        
+        # Fall back to a gradient-based saliency map
+        print("Falling back to gradient-based saliency map")
+        
+        import tensorflow as tf
+        
+        # Convert image to tensor
+        img_tensor = tf.convert_to_tensor(img_array, dtype=tf.float32)
+        
+        # Get model prediction
+        pred = model.predict(img_array)
+        pred_class = np.argmax(pred[0])
+        
+        # Calculate gradient-based saliency
+        with tf.GradientTape() as tape:
+            tape.watch(img_tensor)
+            predictions = model(img_tensor)
+            target_output = predictions[:, pred_class]
+        
+        # Calculate gradients
+        grads = tape.gradient(target_output, img_tensor)
+        
+        # Take absolute value and max across color channels
+        saliency = tf.reduce_max(tf.abs(grads), axis=-1).numpy()[0]
+        
+        # Normalize
+        saliency = (saliency - saliency.min()) / (saliency.max() - saliency.min() + 1e-7)
+        
+        # Create heatmap
+        heatmap = plt.cm.jet(saliency)[:, :, :3]
+        
+        # Blend with original image
+        original_img = img_array[0]
+        saliency_img = 0.7 * original_img + 0.3 * heatmap
+        
+        # Return the saliency map
+        return saliency_img, saliency, None, pred_class, pred[0][pred_class]
+
+def occlusion_explanation(model, img_array, patch_size=8, stride=4):
+    """
+    Generate explanation using occlusion sensitivity - a model-agnostic method
+    that doesn't rely on gradients
+    
+    Args:
+        model: TensorFlow model
+        img_array: Image to explain (1, height, width, channels)
+        patch_size: Size of the occluding patch
+        stride: Stride for sliding the patch
+        
+    Returns:
+        Visualization and values similar to SHAP output format
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from tqdm import tqdm
+    
+    print(f"Input image shape: {img_array.shape}")
+    
+    try:
+        # Get the original prediction
+        pred = model.predict(img_array)
+        pred_class = np.argmax(pred[0])
+        orig_conf = pred[0][pred_class]
+        
+        print(f"Original prediction: Class {pred_class} with confidence {orig_conf:.4f}")
+        
+        # Create importance map
+        height, width = img_array.shape[1:3]
+        importance_map = np.zeros((height, width))
+        
+        # Create a copy of the image
+        img_batch = np.tile(img_array, (1, 1, 1, 1))
+        
+        total_patches = ((height - patch_size) // stride + 1) * ((width - patch_size) // stride + 1)
+        print(f"Analyzing with {patch_size}x{patch_size} patches, stride {stride}")
+        print(f"Total patches to analyze: {total_patches}")
+        
+        # Create an occluded version for each patch
+        for y in range(0, height - patch_size + 1, stride):
+            for x in range(0, width - patch_size + 1, stride):
+                # Create a copy of the image
+                occluded_img = img_array.copy()
+                
+                # Apply occlusion (gray patch)
+                occluded_img[0, y:y+patch_size, x:x+patch_size, :] = 0.5
+                
+                # Get prediction for occluded image
+                occluded_pred = model.predict(occluded_img, verbose=0)
+                occluded_conf = occluded_pred[0][pred_class]
+                
+                # Calculate importance as drop in confidence
+                importance = orig_conf - occluded_conf
+                
+                # Update importance map
+                importance_map[y:y+patch_size, x:x+patch_size] += importance
+        
+        # Normalize importance map
+        if np.max(importance_map) > 0:
+            importance_map = importance_map / np.max(importance_map)
+        
+        # Create heatmap
+        heatmap = plt.cm.jet(importance_map)[:, :, :3]
+        
+        # Blend with original image
+        original_img = img_array[0]
+        if original_img.max() > 1.0:
+            original_img = original_img / 255.0
+        explanation_img = 0.7 * original_img + 0.3 * heatmap
+        
+        # Return results in a format similar to the original SHAP function
+        return explanation_img, importance_map, None, pred_class, orig_conf
+        
+    except Exception as e:
+        print(f"Error generating occlusion explanation: {e}")
+        
+        # Fall back to very simple pixel-wise occlusion
+        print("Falling back to pixel-wise occlusion analysis")
+        
+        # Get the original prediction
+        pred = model.predict(img_array)
+        pred_class = np.argmax(pred[0])
+        orig_conf = pred[0][pred_class]
+        
+        # Create a simplified importance map by sampling fewer points
+        height, width = img_array.shape[1:3]
+        importance_map = np.zeros((height, width))
+        
+        # Sample points with a larger stride
+        large_stride = 16
+        sample_points = []
+        for y in range(0, height, large_stride):
+            for x in range(0, width, large_stride):
+                sample_points.append((y, x))
+        
+        for y, x in sample_points:
+            # Create a copy with a single pixel occluded
+            occluded_img = img_array.copy()
+            occluded_img[0, y, x, :] = 0.5
+            
+            # Get prediction
+            occluded_pred = model.predict(occluded_img, verbose=0)
+            occluded_conf = occluded_pred[0][pred_class]
+            
+            # Calculate importance
+            importance = orig_conf - occluded_conf
+            
+            # Update importance map
+            importance_map[y, x] = importance
+        
+        # Use interpolation to fill the gaps
+        from scipy.ndimage import gaussian_filter
+        importance_map = gaussian_filter(importance_map, sigma=large_stride/2)
+        
+        # Normalize
+        if np.max(importance_map) > 0:
+            importance_map = importance_map / np.max(importance_map)
+        
+        # Create heatmap
+        heatmap = plt.cm.jet(importance_map)[:, :, :3]
+        
+        # Blend with original image
+        original_img = img_array[0]
+        if original_img.max() > 1.0:
+            original_img = original_img / 255.0
+        explanation_img = 0.7 * original_img + 0.3 * heatmap
+        
+        return explanation_img, importance_map, None, pred_class, orig_conf
+# 4. Experiments to Improve Explainability
+# ---------------------------------------
+
+def combined_explainability(model, img_path, class_names, background_images=None, img_size=(64, 64)):
+    """
+    Combine different explainability methods for a comprehensive view
+    """
+    # Load and preprocess the image
+    img_array = load_and_preprocess_image(img_path, img_size)
+    
+    # Get model prediction
+    pred = model.predict(img_array)
+    pred_class = np.argmax(pred[0])
+    confidence = pred[0][pred_class]
+    
+    # Create figure
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # 1. Original image
+    orig_img = img_array[0]
+    axes[0, 0].imshow(orig_img)
+    axes[0, 0].set_title('Original Image')
+    axes[0, 0].axis('off')
+    
+    # 2. GradCAM visualization
+
+    from simplified_gradcam import simple_gradcam
+    _, gradcam_img, _ = simple_gradcam(model, img_array)
+    axes[0, 1].imshow(gradcam_img / 255.0)  # Normalize back to 0-1
+    axes[0, 1].set_title('GradCAM Visualization')
+    axes[0, 1].axis('off')
+    
+    # 3. Predicted class probabilities
+    class_probs = pred[0]
+    sorted_idx = np.argsort(class_probs)[::-1]
+    top_classes = [class_names[i] for i in sorted_idx[:5]]
+    top_probs = [class_probs[i] for i in sorted_idx[:5]]
+    
+    y_pos = np.arange(len(top_classes))
+    axes[0, 2].barh(y_pos, top_probs)
+    axes[0, 2].set_yticks(y_pos)
+    axes[0, 2].set_yticklabels(top_classes)
+    axes[0, 2].set_title('Top Class Probabilities')
+    axes[0, 2].set_xlim(0, 1)
+    
+    # 4. LIME explanation (positive features)
+    try:
+        lime_img, lime_img_neg, _, _, _ = lime_explanation(model, img_array, class_names)
+        axes[1, 0].imshow(lime_img)
+        axes[1, 0].set_title('LIME (Positive Features)')
+        axes[1, 0].axis('off')
+        
+        # 5. LIME explanation (negative features)
+        axes[1, 1].imshow(lime_img_neg)
+        axes[1, 1].set_title('LIME (Negative Features)')
+        axes[1, 1].axis('off')
+    except Exception as e:
+        print(f"Error with LIME: {e}")
+        axes[1, 0].text(0.5, 0.5, 'LIME error', ha='center', va='center')
+        axes[1, 0].axis('off')
+        axes[1, 1].text(0.5, 0.5, 'LIME error', ha='center', va='center')
+        axes[1, 1].axis('off')
+    
+    # 6. SHAP explanation (if background images are provided)
+    # if background_images is not None:
+    #     try:
+    #         shap_img, _, _, _, _ = shap_explanation(model, img_array, background_images)
+    #         axes[1, 2].imshow(shap_img)
+    #         axes[1, 2].set_title('SHAP Explanation')
+    #         axes[1, 2].axis('off')
+    #     except Exception as e:
+    #         print(f"Error with SHAP: {e}")
+    #         axes[1, 2].text(0.5, 0.5, 'SHAP error', ha='center', va='center')
+    #         axes[1, 2].axis('off')
+    # else:
+    #     axes[1, 2].text(0.5, 0.5, 'Background images required for SHAP', ha='center', va='center')
+    #     axes[1, 2].axis('off')
+    
+    # Try SHAP-like explanation
+    title = 'Occlusion Explanation'
+    
+    # Optional: If you want to use background images when available (for improved results)
+    # but still produce an explanation even when they're not available
+    try:
+        if background_images is not None:
+            # Use occlusion with background (potentially could improve results in some cases)
+            # but doesn't actually need the background for technical reasons
+            occlusion_img, _, _, _, _ = occlusion_explanation(model, img_array, patch_size=8, stride=8)
+            title = 'Detailed Explanation'  # Optional different title when you have background images
+        else:
+            # Still works without background images
+            occlusion_img, _, _, _, _ = occlusion_explanation(model, img_array, patch_size=12, stride=12)
+            # Using larger patches/stride for faster computation when no background
+            
+        axes[1, 2].imshow(occlusion_img)
+        axes[1, 2].set_title(title)
+        axes[1, 2].axis('off')
+    except Exception as e:
+        print(f"Error with explanation: {e}")
+        axes[1, 2].text(0.5, 0.5, 'Explanation error', ha='center', va='center')
+        axes[1, 2].axis('off')
+    
+    # Add prediction information as title
+    fig.suptitle(f"Prediction: {class_names[pred_class]} (Confidence: {confidence:.2f})", fontsize=16)
+    
+    return fig
+
+def evaluate_explainability_methods(model, test_df, class_names, num_samples=5):
+    """
+    Evaluate different explainability methods on sample images
+    """
+    # Import the robust implementation
+    from simplified_gradcam import simple_gradcam
+    
+    # Sample random images from test set
+    sampled_indices = np.random.choice(len(test_df), num_samples, replace=False)
+    
+    # Create a set of background images for SHAP
+    background_images = []
+    for i in range(min(10, len(test_df))):
+        img_path = test_df.iloc[i]['path']
+        img_array = load_and_preprocess_image(img_path)
+        background_images.append(img_array[0])
+    
+    # Generate explanations for each sampled image
+    for idx, i in enumerate(sampled_indices):
+        img_path = test_df.iloc[i]['path']
+        true_class = test_df.iloc[i]['label']
+        
+        # Create combined visualization
+        fig = combined_explainability(model, img_path, class_names, background_images)
+        
+        # Add true class information
+        plt.figtext(0.5, 0.01, f"True Class: {class_names[int(true_class)]}", ha='center', fontsize=12)
+        
+        # Save the figure
+        plt.savefig(f'explanation_sample_{idx+1}.png', bbox_inches='tight')
+        plt.close(fig)
+    
+    print(f"Generated explanations for {num_samples} sample images.")
+    
+    # Compare different variants of GradCAM
+    img_path = test_df.iloc[sampled_indices[0]]['path']
+    img_array = load_and_preprocess_image(img_path)
+    
+    # Compare GradCAM for different layers
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # Original image
+    axes[0, 0].imshow(img_array[0])
+    axes[0, 0].set_title('Original Image')
+    axes[0, 0].axis('off')
+    
+    # Find conv layers to visualize
+    conv_layers = []
+    for layer in model.layers:
+        if isinstance(layer, keras.layers.Conv2D):
+            conv_layers.append(layer.name)
+        elif hasattr(layer, 'layers'):  # For models with nested layers like ResNet
+            for inner_layer in layer.layers:
+                if isinstance(inner_layer, keras.layers.Conv2D):
+                    conv_layers.append(inner_layer.name)
+    
+    # Select up to 5 layers evenly spaced throughout the network
+    if len(conv_layers) > 5:
+        indices = np.linspace(0, len(conv_layers)-1, 5, dtype=int)
+        conv_layers = [conv_layers[i] for i in indices]
+    
+    # Generate GradCAM for each layer
+    for i, layer_name in enumerate(conv_layers[:5]):  # Limit to 5 layers
+        row, col = (i // 3) + 1, i % 3
+        if row < 2 and col < 3:  # Ensure we don't exceed the grid
+            try:
+                _, gradcam_img, _ = simple_gradcam(model, img_array)
+                axes[row, col].imshow(gradcam_img / 255.0)
+                axes[row, col].set_title(f'GradCAM: {layer_name.split("/")[-1]}')
+                axes[row, col].axis('off')
+            except Exception as e:
+                print(f"Error with GradCAM for layer {layer_name}: {e}")
+                axes[row, col].text(0.5, 0.5, f'Error: {layer_name}', ha='center', va='center')
+                axes[row, col].axis('off')
+    
+    # Fill any unused subplots
+    for i in range(len(conv_layers[:5]) + 1, 6):
+        row, col = (i // 3) + 1, i % 3
+        if row < 2 and col < 3:
+            axes[row, col].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig('gradcam_layer_comparison.png', bbox_inches='tight')
+    plt.close()
+    
+    return sampled_indices
+
 
 # 5. Export ViT model to TFLite
 # ---------------------------
@@ -1014,6 +1546,7 @@ def evaluate_tflite_model(tflite_model_path, test_data, class_names, num_samples
         'f1': f1,
         'confusion_matrix': cm
     }
+    
 
 # Main function to run the entire pipeline
 def main():
@@ -1046,8 +1579,9 @@ def main():
     num_classes = 7
     
     # Calculate num_patches based on input size and patch size
-    patch_size = 4
+    patch_size = 8
     num_patches = (input_shape[0] // patch_size) * (input_shape[1] // patch_size)
+
     
     model = create_vit_classifier(
         input_shape=input_shape,
@@ -1066,9 +1600,11 @@ def main():
     # 4. Train the model
     print("\n4. Training the model...")
     if use_generators:
-        history = train_model(model, train_generator, val_generator, epochs=30, use_generators=True)
+        history = train_model(model, train_generator, val_generator, epochs=20, use_generators=True)
     else:
-        history = train_model(model, (X_train, y_train), (X_val, y_val), epochs=30, batch_size=128, use_generators=False)
+        history = train_model(model, (X_train, y_train), (X_val, y_val), epochs=2, batch_size=128, use_generators=False)
+    
+    model.save('best_model_64_VIT.keras')
     
     # 5. Evaluate the model
     print("\n5. Evaluating the model...")
@@ -1082,6 +1618,10 @@ def main():
     else:
         class_names = [name for idx, (name, _) in classes.items()]
         results = evaluate_model(model, (X_test, y_test), class_names, use_generator=False)
+    
+    # 4. Apply explainability techniques
+    print("\n4. Applying explainability techniques...")
+    evaluate_explainability_methods(model, test_df, class_names, num_samples=5)
     
     # 6. Export model to TFLite
     print("\n6. Exporting model to TFLite with quantization...")
@@ -1099,3 +1639,8 @@ def main():
 if __name__ == "__main__":
     # Execute the main function
     main()
+    # Load your .keras model
+    #model = keras.models.load_model("best_model_64_VIT.keras")
+
+    # Export in SavedModel format (for GCP)
+    #model.export("saved_model") 
